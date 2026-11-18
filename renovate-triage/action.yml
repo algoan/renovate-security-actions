@@ -1,5 +1,5 @@
 name: Renovate triage
-description: Score the vulnerabilities fixed by a Renovate PR (CVSS) and route it (hotfix, automerge or review), with a Notion ticket for security fixes
+description: Score the vulnerabilities fixed by a Renovate PR (CVSS) and route it (hotfix, automerge or review)
 inputs:
   github_token:
     description: Token reading the GitHub Advisory Database and editing the PR (pull-requests and issues write)
@@ -30,7 +30,7 @@ inputs:
     required: false
     default: "4.0"
   hotfix_enabled:
-    description: Set to false to ship critical fixes through main (automerge tier, critical label, Notion P1) instead of a hotfix
+    description: Set to false to ship critical fixes through main (automerge tier, critical label) instead of a hotfix
     required: false
     default: "true"
   ecosystems:
@@ -47,22 +47,6 @@ inputs:
     default: ""
   nvd_api_key:
     description: NVD API key, raises the NVD rate limit (upstream ecosystem)
-    required: false
-    default: ""
-  notion_token:
-    description: Notion integration token. Empty to skip the ticket
-    required: false
-    default: ""
-  notion_data_source_id:
-    description: Notion data source of the tickets
-    required: false
-    default: 01cee5a0-2b64-49a0-b9de-82198932bfb6
-  notion_project:
-    description: Prefix of the ticket Project option
-    required: false
-    default: Technique
-  notion_sub_tech_team:
-    description: Prefix of the ticket Sub-Tech-Team option, empty to leave it unset
     required: false
     default: ""
 outputs:
@@ -84,9 +68,6 @@ outputs:
   update_level:
     description: none, digest, patch, minor or major
     value: ${{ steps.triage.outputs.update_level }}
-  ticket_id:
-    description: Notion ticket id (ALG-NNNN), kept from the previous triage comment when Notion can't be reached
-    value: ${{ steps.comment.outputs.ticket_id || steps.notion.outputs.ticket_id }}
 
 runs:
   using: composite
@@ -145,30 +126,8 @@ runs:
         [[ "$SECURITY_LABEL" == "true" ]] && args+=(--security-label)
         python3 -m renovate_security "${args[@]}"
 
-    # A Notion outage must not block labelling and routing.
-    - name: Create or update the Notion ticket
-      id: notion
-      if: steps.triage.outputs.tier != 'none'
-      continue-on-error: true
-      shell: bash
-      env:
-        PYTHONPATH: ${{ github.action_path }}/../renovate-security
-        NOTION_TOKEN: ${{ inputs.notion_token }}
-        PR_URL: ${{ github.server_url }}/${{ github.repository }}/pull/${{ inputs.pr_number }}
-        DATA_SOURCE_ID: ${{ inputs.notion_data_source_id }}
-        PROJECT: ${{ inputs.notion_project }}
-        SUB_TECH_TEAM: ${{ inputs.notion_sub_tech_team }}
-      run: |
-        if [[ -z "$NOTION_TOKEN" ]]; then
-          echo "::warning title=Notion ticket skipped::notion_token is not set"
-          exit 0
-        fi
-        python3 -m renovate_security.notion_ticket upsert --pr-url "$PR_URL" --triage "$RUNNER_TEMP/triage.json" \
-          --data-source-id "$DATA_SOURCE_ID" --project "$PROJECT" --sub-tech-team "$SUB_TECH_TEAM"
-
     # The PR title stays Renovate's: Renovate rewrites it on every pass (which used to retrigger
-    # this triage), and recognises a PR closed on purpose by its exact title. The Notion ticket is
-    # in the triage comment instead.
+    # this triage), and recognises a PR closed on purpose by its exact title.
     - name: Update PR labels
       shell: bash
       env:
@@ -205,28 +164,16 @@ runs:
         GH_REPO: ${{ github.repository }}
         GH_TOKEN: ${{ inputs.github_token }}
         PR_NUMBER: ${{ inputs.pr_number }}
-        TICKET_ID: ${{ steps.notion.outputs.ticket_id }}
-        TICKET_URL: ${{ steps.notion.outputs.ticket_url }}
       run: |
         marker="<!-- renovate-triage -->"
         comment_id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate \
           --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n1)
-        # Keep the ticket of the previous triage when Notion could not be reached.
-        ticket=""
-        if [[ -n "$TICKET_ID" ]]; then
-          ticket="**Notion ticket:** [$TICKET_ID]($TICKET_URL)"
-        elif [[ -n "$comment_id" ]]; then
-          ticket=$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" --jq .body \
-            | grep -m1 -E '^\*\*Notion ticket:\*\* \[ALG-[0-9]+\]\(https://[^ )]+\)$' || true)
-        fi
         {
           echo "$marker"
           echo "### 🔐 Renovate security triage"
           echo
-          [[ -n "$ticket" ]] && echo "$ticket" && echo
           cat "$RUNNER_TEMP/triage.md"
         } > "$RUNNER_TEMP/comment.md"
-        echo "ticket_id=$(grep -oE 'ALG-[0-9]+' <<<"$ticket" | head -n1 || true)" >> "$GITHUB_OUTPUT"
         if [[ -n "$comment_id" ]]; then
           gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" -F body=@"$RUNNER_TEMP/comment.md" > /dev/null
         else

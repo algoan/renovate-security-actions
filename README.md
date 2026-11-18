@@ -4,7 +4,7 @@ GitHub Actions that route [Renovate](https://docs.renovatebot.com/) PRs accordin
 
 | Action | Role |
 |---|---|
-| [`renovate-triage`](renovate-triage/) | Scores the CVEs fixed by a Renovate PR (max CVSS), creates the Notion ticket, labels the PR, comments the advisories and the ticket |
+| [`renovate-triage`](renovate-triage/) | Scores the CVEs fixed by a Renovate PR (max CVSS), labels the PR and comments the advisories |
 | [`renovate-auto-approve`](renovate-auto-approve/) | Approves Renovate's own commits, so a Renovate PR needs one human review |
 | [`renovate-automerge`](renovate-automerge/) | Merges green automerge-tier PRs that only bump patch versions or digests |
 

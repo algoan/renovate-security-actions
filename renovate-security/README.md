@@ -4,7 +4,7 @@ Shared code and guide of the actions that route [Renovate](https://docs.renovate
 
 | Action | Role |
 |---|---|
-| [`renovate-triage`](../renovate-triage/) | Scores the CVEs fixed by a Renovate PR (max CVSS), creates the Notion ticket, labels the PR, comments the advisories and the ticket |
+| [`renovate-triage`](../renovate-triage/) | Scores the CVEs fixed by a Renovate PR (max CVSS), labels the PR and comments the advisories |
 | [`renovate-auto-approve`](../renovate-auto-approve/) | Approves Renovate's own commits, so a Renovate PR needs one human review |
 | [`renovate-automerge`](../renovate-automerge/) | Merges green automerge-tier PRs that only bump patch versions or digests |
 
@@ -18,9 +18,9 @@ This public repository holds the subset of the flow used by Algoan's **public** 
 flowchart TD
     PR[Renovate PR] --> T[renovate-triage<br/>max CVSS of the advisories the PR fixes]
     T -->|no advisory| N[Regular PR<br/>auto-approve + 1 human review]
-    T -->|CVSS < 4.0| M[needs-review + Notion ticket<br/>1 human review]
-    T -->|4.0 ≤ CVSS, or ≥ 9.0 with hotfix off| A[automerge + Notion ticket<br/>critical label and P1 from 9.0]
-    T -->|CVSS ≥ 9.0, hotfix on| H[hotfix + Notion ticket P1]
+    T -->|CVSS < 4.0| M[needs-review<br/>1 human review]
+    T -->|4.0 ≤ CVSS, or ≥ 9.0 with hotfix off| A[automerge<br/>critical label from 9.0]
+    T -->|CVSS ≥ 9.0, hotfix on| H[hotfix]
     A --> AM{renovate-automerge<br/>patch or digest only?}
     AM -->|yes, CI green| MM[merged on main]
     AM -->|minor / major| R[1 human review]
@@ -42,8 +42,6 @@ A fix is scored by the advisories that affect the old version and no longer affe
 
 Closing a hotfix PR without merging it is a decision not to hotfix: later runs leave it closed while Renovate keeps the same versions, and the Renovate PR goes through main. When Renovate moves to other versions, it comments once on its PR to ask for a manual hotfix if needed.
 
-A Notion ticket (*Tickets* database, type *Vulnerability*, P1 to P4 from the CVSS) is created for every security PR. The ticket holds the PR in its *Git Pull Request* field, and the triage comment of the PR links the ticket (`[ALG-1234]`). The id stays out of the PR title: Renovate rewrites its titles, and recognises a PR closed on purpose by its exact title. A hotfix PR, opened by the app, keeps the id in its title.
-
 ### Turning the hotfix flow off
 
 The hotfix flow is on by default. A repository that ships everything through its default branch turns it off with either:
@@ -51,7 +49,7 @@ The hotfix flow is on by default. A repository that ships everything through its
 - `hotfix_enabled: 'false'` on `renovate-triage` and `renovate-automerge`;
 - or a `cvss_hotfix_threshold` above 10 (e.g. the repository variable `CVSS_HOTFIX_THRESHOLD=11`): no CVSS reaches it. Lowering it to 9 or less turns the flow back on.
 
-Critical fixes then take the automerge tier, with the `critical` label, a P1 ticket and a warning to promote them to production quickly. Don't add the `open-hotfix` job nor the hotfix promotion workflow.
+Critical fixes then take the automerge tier, with the `critical` label and a warning to promote them to production quickly. Don't add the `open-hotfix` job nor the hotfix promotion workflow.
 
 ## Ecosystems
 
@@ -147,5 +145,4 @@ pip install pytest pyyaml
 python -m pytest
 # Score a diff locally
 GITHUB_TOKEN=$(gh auth token) PYTHONPATH=. python -m renovate_security triage --base origin/main --head HEAD --out /tmp/t.json --markdown /tmp/t.md
-python -m renovate_security.notion_ticket upsert --dry-run --pr-url <pr-url> --triage /tmp/t.json
 ```

@@ -7,9 +7,8 @@ name: Renovate triage
 # See docs/RENOVATE.md.
 #
 # pull_request_target: the workflow always comes from the base branch, so a Renovate PR (or a push
-# to its branch) cannot change what runs with NOTION_TOKEN and a write GITHUB_TOKEN
-# before review. The job only runs for PRs opened by renovate[bot]: a PR from a fork never reaches
-# the secrets.
+# to its branch) cannot change what runs with a write GITHUB_TOKEN before review. The job only runs
+# for PRs opened by renovate[bot]: a PR from a fork never gets that token.
 
 on:
   pull_request_target:
@@ -53,8 +52,6 @@ jobs:
           cvss_automerge_threshold: ${{ vars.CVSS_AUTOMERGE_THRESHOLD || '4.0' }}
           # npm: the root package-lock.json (examples/google-pubsub is ignored by Renovate).
           ecosystems: npm
-          notion_token: ${{ secrets.NOTION_TOKEN }}
-          notion_sub_tech_team: ${{ vars.NOTION_SUB_TECH_TEAM || 'Back' }}
 
       # pull_request_target runs don't trigger renovate-automerge through workflow_run (they belong
       # to the base branch), and labels set with the GITHUB_TOKEN trigger nothing: start it here. It

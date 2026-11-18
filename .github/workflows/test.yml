@@ -1,0 +1,40 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit tests and action checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Same Python as ubuntu-latest runners, where the actions run with the system python3.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: pip install pytest pyyaml
+
+      - name: Run tests
+        working-directory: renovate-security
+        run: python -m pytest -q
+
+      - name: Install actionlint
+        run: bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+
+      - name: Lint workflows
+        run: ./actionlint -color .github/workflows/*.yml
+
+      - name: Lint example workflows
+        run: ./actionlint -color renovate-security/examples/*.yml

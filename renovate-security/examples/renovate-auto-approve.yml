@@ -1,0 +1,23 @@
+name: Renovate auto-approve
+
+# Only useful where the branch ruleset requires approvals: the bot gives one, a human the other.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  auto-approve:
+    name: Auto-approve Renovate dependency PRs
+    if: >-
+      github.actor == 'renovate[bot]'
+      && github.run_attempt == 1
+      && github.event.pull_request.user.login == 'renovate[bot]'
+      && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: algoan/renovate-security-actions/renovate-auto-approve@v1.0.0 # pin to the commit SHA of the release, with its tag in this comment

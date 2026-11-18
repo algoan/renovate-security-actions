@@ -1,0 +1,360 @@
+name: Renovate automerge
+description: Merge a green Renovate security PR in the automerge tier that only bumps patch versions (or digests), or the Renovate PR of a promoted hotfix
+inputs:
+  github_token:
+    description: Token reading the PR, its checks and the advisories. Without app_id, it also merges the PR (contents and pull-requests write)
+    required: false
+    default: ${{ github.token }}
+  app_id:
+    description: ID of the GitHub App merging the PR (a pull-request bypass actor of the base branch ruleset). Empty to merge with github_token, where the branch ruleset requires no approval
+    required: false
+    default: ""
+  private_key:
+    description: Private key of that GitHub App. Empty with app_id
+    required: false
+    default: ""
+  pr_number:
+    description: PR to merge. Defaults to the open PR of the workflow_run head branch
+    required: false
+    default: ""
+  renovate_app_slug:
+    description: Slug of the GitHub App Renovate runs as (`renovate` for the Mend app, your own app when Renovate is self-hosted)
+    required: false
+    default: renovate
+  renovate_email:
+    description: Commit author email of that app's bot (`<bot user id>+<slug>[bot]@users.noreply.github.com`, the id from `gh api 'users/<slug>[bot]'`)
+    required: false
+    default: 29139614+renovate[bot]@users.noreply.github.com
+  hotfix_app_slug:
+    description: Slug of the GitHub App opening hotfix PRs (renovate-open-hotfix)
+    required: false
+    default: algoan-merger
+  required_checks:
+    description: Comma-separated check names (the CI jobs) that must have succeeded on the head commit. Required, so a PR is never merged before its CI has started
+    required: true
+  allowed_paths:
+    description: Extra space-separated path globs the PR may change (e.g. `k8s/ray-service-*.yaml`). Dependency files of the selected `ecosystems` and files with `<!-- renovate:` markers are always allowed under lockfile_dir
+    required: false
+    default: ""
+  merge_method:
+    description: How the PR is merged, `squash`, `merge` or `rebase`; the repository must allow it (e.g. `merge` where squash is off and the release reads every conventional commit)
+    required: false
+    default: squash
+  cvss_hotfix_threshold:
+    description: Same value as renovate-triage
+    required: false
+    default: "9.0"
+  cvss_automerge_threshold:
+    description: Same value as renovate-triage
+    required: false
+    default: "4.0"
+  hotfix_enabled:
+    description: Same value as renovate-triage
+    required: false
+    default: "true"
+  ecosystems:
+    description: Same value as renovate-triage
+    required: false
+    default: auto
+  lockfile_dir:
+    description: Same value as renovate-triage; dependency files outside it need allowed_paths
+    required: false
+    default: ""
+  upstream_cpes:
+    description: Same value as renovate-triage
+    required: false
+    default: ""
+  nvd_api_key:
+    description: Same value as renovate-triage
+    required: false
+    default: ""
+outputs:
+  merged:
+    description: true when the PR was merged
+    value: ${{ steps.merge.outputs.merged }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check that the PR can be merged
+      id: check
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        REQUIRED_CHECKS: ${{ inputs.required_checks }}
+        MERGE_METHOD: ${{ inputs.merge_method }}
+        RENOVATE_APP_SLUG: ${{ inputs.renovate_app_slug }}
+        FETCH_TOKEN: ${{ inputs.github_token }}
+        GIT_FETCH: ${{ github.action_path }}/../renovate-security/scripts/git_fetch.sh
+        REVIEW_GATE: ${{ github.action_path }}/../renovate-security/scripts/review_gate.sh
+      run: |
+        if [[ -z "${REQUIRED_CHECKS//[ ,]/}" ]]; then
+          echo "::error::required_checks must name the CI checks a merge waits for"; exit 1
+        fi
+        if [[ ! "$MERGE_METHOD" =~ ^(squash|merge|rebase)$ ]]; then
+          echo "::error::merge_method must be squash, merge or rebase"; exit 1
+        fi
+        if [[ ! "$RENOVATE_APP_SLUG" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+          echo "::error::renovate_app_slug must be a GitHub App slug"; exit 1
+        fi
+        fields=number,state,headRefName,headRefOid,baseRefName,isDraft,author,labels
+        if [[ -n "$PR_NUMBER" ]]; then
+          if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::pr_number must be a number"; exit 1
+          fi
+          pr=$(gh pr view "$PR_NUMBER" -R "$GITHUB_REPOSITORY" --json "$fields")
+          head_sha=$(jq -r .headRefOid <<<"$pr")
+        elif [[ "$RUN_HEAD_BRANCH" == renovate/* ]]; then
+          pr=$(gh pr list -R "$GITHUB_REPOSITORY" --head "$RUN_HEAD_BRANCH" --state open \
+            --json "$fields" --jq '.[0] // empty')
+          head_sha="$RUN_HEAD_SHA"
+        else
+          echo "Not a Renovate branch"; exit 0
+        fi
+        if [[ -z "$pr" || "$(jq -r .state <<<"$pr")" != "OPEN" ]]; then
+          echo "No open PR to merge"; exit 0
+        fi
+
+        number=$(jq -r .number <<<"$pr")
+        labels=$(jq -r '[.labels[].name] | join(",")' <<<"$pr")
+        reason=""
+        # A bot author only: a user account named like the app must not pass.
+        author=$(jq -r .author.login <<<"$pr")
+        [[ "$(jq -r .author.is_bot <<<"$pr")" == "true" \
+          && ("$author" == "app/$RENOVATE_APP_SLUG" || "$author" == "${RENOVATE_APP_SLUG}[bot]") ]] \
+          || reason="not authored by Renovate"
+        [[ "$(jq -r .headRefName <<<"$pr")" == renovate/* ]] || reason="not a Renovate branch"
+        [[ ",$labels," == *",automerge,"* || ",$labels," == *",hotfix,"* ]] || reason="neither automerge nor hotfix"
+        [[ "$(jq -r .isDraft <<<"$pr")" == "false" ]] || reason="draft PR"
+        [[ "$(jq -r .headRefOid <<<"$pr")" == "$head_sha" ]] || reason="head moved since this run"
+
+        # The bypass merge skips the review rules of the branch: a change request or an unresolved
+        # review thread stops it. Checked here, and again right before the merge.
+        if [[ -z "$reason" ]]; then
+          reason=$("$REVIEW_GATE" "$GITHUB_REPOSITORY" "$number")
+          if [[ -n "$reason" ]]; then
+            # Resolving a thread starts no workflow: tell how to retry.
+            echo "::notice::Not merging PR #$number: $reason. Once it is cleared, run this workflow with pr_number $number, or let the next CI run start it."
+            exit 0
+          fi
+        fi
+
+        if [[ -z "$reason" ]]; then
+          # Only the latest run of each check (name and app) counts: runs cancelled by a newer one are
+          # not failures, and a check of another app with the same name is still evaluated.
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$head_sha/check-runs" --paginate --jq '.check_runs[]' \
+            | jq -rs 'group_by([.name, .app.id]) | map(max_by(.id)) | .[] | [.name, .status, (.conclusion // "")] | @tsv')
+          if grep -qP '\t(queued|in_progress|pending|waiting|requested)\t' <<<"$runs"; then
+            reason="checks still running"
+          elif cut -f3 <<<"$runs" | grep -qvxE 'success|skipped|neutral'; then
+            reason="a check failed"
+          else
+            IFS=',' read -ra required <<<"$REQUIRED_CHECKS"
+            for name in "${required[@]}"; do
+              name="$(xargs <<<"$name")"
+              [[ -z "$name" ]] && continue
+              awk -F'\t' -v n="$name" '$1 == n && $3 == "success" { found = 1 } END { exit !found }' <<<"$runs" \
+                || reason="required check '$name' has not succeeded"
+            done
+          fi
+        fi
+
+        if [[ -n "$reason" ]]; then
+          echo "Skipping PR #$number: $reason"
+          exit 0
+        fi
+        base=$(jq -r .baseRefName <<<"$pr")
+        "$GIT_FETCH" "$head_sha" "+refs/heads/$base:refs/remotes/origin/$base"
+        merge_base=$(git merge-base "origin/$base" "$head_sha")
+        {
+          echo "number=$number"
+          echo "head_sha=$head_sha"
+          echo "merge_base=$merge_base"
+        } >> "$GITHUB_OUTPUT"
+        if git diff --name-only "$merge_base" "$head_sha" | grep -qiE '(^|/)([^/]*\.)?dockerfile(\.[^/]*)?$'; then
+          echo "docker=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    # The bypass app skips human review: only merge a diff Renovate itself wrote, on dependency files.
+    - name: Check the diff only contains Renovate dependency changes
+      id: diff
+      if: steps.check.outputs.number != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        MERGE_BASE: ${{ steps.check.outputs.merge_base }}
+        HEAD_SHA: ${{ steps.check.outputs.head_sha }}
+        NUMBER: ${{ steps.check.outputs.number }}
+        ALLOWED_PATHS: ${{ inputs.allowed_paths }}
+        LOCKFILE_DIR: ${{ inputs.lockfile_dir }}
+        ECOSYSTEMS: ${{ inputs.ecosystems }}
+        RENOVATE_EMAIL: ${{ inputs.renovate_email }}
+        RENOVATE_APP_SLUG: ${{ inputs.renovate_app_slug }}
+      run: |
+        # Only the files of the ecosystems the tier is computed on: other ones need allowed_paths.
+        [[ -z "${ECOSYSTEMS// /}" || "$ECOSYSTEMS" == auto ]] && ECOSYSTEMS=uv,poetry,npm,pnpm,docker,upstream
+        defaults=()
+        dockerfiles=false
+        IFS=, read -ra selected <<<"${ECOSYSTEMS// /}"
+        for ecosystem in "${selected[@]}"; do
+          case "$ecosystem" in
+            uv) defaults+=(uv.lock pyproject.toml) ;;
+            poetry) defaults+=(poetry.lock pyproject.toml) ;;
+            npm) defaults+=(package.json package-lock.json) ;;
+            pnpm) defaults+=(package.json pnpm-lock.yaml pnpm-workspace.yaml) ;;
+            docker | upstream) dockerfiles=true ;;
+          esac
+        done
+        read -ra extra <<<"$ALLOWED_PATHS"
+        unexpected=()
+        while IFS= read -r file; do
+          [[ -z "$file" ]] && continue
+          ok=false
+          # Only the scope the tier was computed on: other projects need allowed_paths.
+          scope="${LOCKFILE_DIR%/}"
+          in_scope=true
+          [[ -z "$scope" || "$file" == "$scope/"* ]] || in_scope=false
+          for pattern in "${defaults[@]}"; do
+            # shellcheck disable=SC2053
+            [[ "$in_scope" == true && "${file##*/}" == $pattern ]] && ok=true
+          done
+          # Dockerfile names, as detected by the triage (case-insensitive, prefix and suffix).
+          if [[ "$in_scope" == true && "$dockerfiles" == true ]] && grep -qiE '^([^/]*\.)?dockerfile(\.[^/]*)?$' <<<"${file##*/}"; then
+            ok=true
+          fi
+          for pattern in "${extra[@]}"; do
+            # shellcheck disable=SC2053
+            [[ "$file" == $pattern ]] && ok=true
+          done
+          if [[ "$ok" == false && "$in_scope" == true ]] && git show "$HEAD_SHA:$file" 2>/dev/null | grep -q '<!-- renovate:'; then
+            ok=true
+          fi
+          [[ "$ok" == true ]] || unexpected+=("$file")
+        done < <(git diff --name-only "$MERGE_BASE" "$HEAD_SHA")
+        # Renovate commits are signed by GitHub (web-flow); a spoofed author email is not.
+        if [[ ! "$RENOVATE_EMAIL" =~ ^[0-9]+\+([a-z0-9-]+)\[bot\]@users\.noreply\.github\.com$ \
+          || "${BASH_REMATCH[1]}" != "$RENOVATE_APP_SLUG" ]]; then
+          echo "::error::renovate_email must be the noreply email of the renovate_app_slug bot"; exit 1
+        fi
+        foreign_commits=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$NUMBER/commits" --paginate \
+          | jq -rs --arg e "$RENOVATE_EMAIL" 'add | .[] | select(.commit.author.email != $e
+            or .commit.committer.email != "noreply@github.com"
+            or (.commit.verification.verified | not)) | .sha[0:8]')
+        if (( ${#unexpected[@]} )) || [[ -n "$foreign_commits" ]]; then
+          echo "::warning::Not merging: unexpected files [$(IFS=,; echo "${unexpected[*]}")] or non-Renovate commits [${foreign_commits//$'\n'/, }]"
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Install Trivy
+      if: steps.diff.outputs.ok == 'true' && steps.check.outputs.docker == 'true'
+      uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+      with:
+        # A fixed release, never `latest`: these jobs hold tokens, and Trivy releases were
+        # compromised in March 2026 (GHSA-69fq-xp46-6x23). Also lets the binary be cached.
+        version: v0.76.2
+        cache: true
+
+    # Labels are mutable: recompute the tier for this exact commit.
+    - name: Confirm the tier
+      id: triage
+      if: steps.diff.outputs.ok == 'true'
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}/../renovate-security
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        NVD_API_KEY: ${{ inputs.nvd_api_key }}
+        UPSTREAM_CPES: ${{ inputs.upstream_cpes }}
+        MERGE_BASE: ${{ steps.check.outputs.merge_base }}
+        HEAD_SHA: ${{ steps.check.outputs.head_sha }}
+        HOTFIX_THRESHOLD: ${{ inputs.cvss_hotfix_threshold }}
+        AUTOMERGE_THRESHOLD: ${{ inputs.cvss_automerge_threshold }}
+        HOTFIX_ENABLED: ${{ inputs.hotfix_enabled }}
+        ECOSYSTEMS: ${{ inputs.ecosystems }}
+        LOCKFILE_DIR: ${{ inputs.lockfile_dir }}
+      run: |
+        # A failed scan blocks the merge: an unscored dependency may hide a bigger change.
+        python3 -m renovate_security triage --base "$MERGE_BASE" --head "$HEAD_SHA" --direct --fail-on-scan-failure \
+          --hotfix-threshold "$HOTFIX_THRESHOLD" --automerge-threshold "$AUTOMERGE_THRESHOLD" \
+          --hotfix-enabled "$HOTFIX_ENABLED" --ecosystems "$ECOSYSTEMS" --lockfile-dir "$LOCKFILE_DIR" \
+          --out "$RUNNER_TEMP/automerge-triage.json" --markdown "$RUNNER_TEMP/automerge-triage.md"
+
+    # A hotfix-tier PR is only merged once a human-reviewed hotfix with the very same pins is in
+    # production.
+    - name: Decide
+      id: decision
+      if: steps.diff.outputs.ok == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        TIER: ${{ steps.triage.outputs.tier }}
+        UPDATE_LEVEL: ${{ steps.triage.outputs.update_level }}
+        # The versions this PR locks, not the minimal replay: only what was reviewed in the
+        # hotfix may be merged without review.
+        PINS: ${{ steps.triage.outputs.pr_pins }}
+        NUMBER: ${{ steps.check.outputs.number }}
+        HOTFIX_APP: ${{ inputs.hotfix_app_slug }}
+      run: |
+        merge=false
+        if [[ "$TIER" == "automerge" && "$UPDATE_LEVEL" =~ ^(patch|digest)$ ]]; then
+          merge=true
+        elif [[ "$TIER" == "automerge" ]]; then
+          echo "::notice::PR $NUMBER is a $UPDATE_LEVEL version jump, not merging: one human review is required"
+        elif [[ "$TIER" == "hotfix" && -n "$PINS" ]]; then
+          shipped=$(gh pr list -R "$GITHUB_REPOSITORY" --head "renovate-hotfix/$NUMBER" --state merged \
+            --json number,author,labels,body \
+            | jq -r --arg marker "<!-- pins: $PINS -->" --arg author "app/$HOTFIX_APP" '.[]
+                | select(.author.login == $author)
+                | select(any(.labels[]; .name == "promoted"))
+                | select(.body | split("\n") | any(. == $marker))
+                | .number' | head -n1)
+          if [[ -n "$shipped" ]]; then
+            echo "Hotfix #$shipped with the same pins is in production"
+            merge=true
+          else
+            echo "::notice::PR $NUMBER is a hotfix whose fix is not in production yet, not merging"
+          fi
+        else
+          echo "::warning::PR $NUMBER triages as '$TIER', not merging"
+        fi
+        echo "merge=$merge" >> "$GITHUB_OUTPUT"
+
+    - name: Create merger token
+      id: app-token
+      if: steps.decision.outputs.merge == 'true' && inputs.app_id != ''
+      uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      with:
+        app-id: ${{ inputs.app_id }}
+        private-key: ${{ inputs.private_key }}
+
+    - name: Merge
+      id: merge
+      if: steps.decision.outputs.merge == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.app-token.outputs.token || inputs.github_token }}
+        BYPASS: ${{ inputs.app_id != '' }}
+        NUMBER: ${{ steps.check.outputs.number }}
+        HEAD_SHA: ${{ steps.check.outputs.head_sha }}
+        MERGE_METHOD: ${{ inputs.merge_method }}
+        REVIEW_TOKEN: ${{ inputs.github_token }}
+        REVIEW_GATE: ${{ github.action_path }}/../renovate-security/scripts/review_gate.sh
+      run: |
+        # A review submitted while the diff was checked and scored leaves the head commit as it was,
+        # so --match-head-commit doesn't catch it: check the reviews again just before merging.
+        blocker=$(GH_TOKEN="$REVIEW_TOKEN" "$REVIEW_GATE" "$GITHUB_REPOSITORY" "$NUMBER")
+        if [[ -n "$blocker" ]]; then
+          echo "::notice::Not merging PR #$NUMBER: $blocker. Once it is cleared, run this workflow with pr_number $NUMBER, or let the next CI run start it."
+          exit 0
+        fi
+        # --admin: the PR is blocked by the approval rule, which only the bypass app may skip. Without
+        # the app, the github_token merges like anyone would: the ruleset must require no approval.
+        admin=()
+        [[ "$BYPASS" == "true" ]] && admin=(--admin)
+        gh pr merge "$NUMBER" -R "$GITHUB_REPOSITORY" "--$MERGE_METHOD" "${admin[@]}" --match-head-commit "$HEAD_SHA"
+        echo "merged=true" >> "$GITHUB_OUTPUT"
+        echo "### Merged #$NUMBER ($HEAD_SHA)" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,17 @@
+{
+  "paths": {
+    "action": "action.yml",
+    "readme": "README.md"
+  },
+  "versioning": {
+    "enabled": true,
+    "override": "",
+    "prefix": "v",
+    "branch": "master"
+  },
+  "owner": "./.github",
+  "repo": "actions/renovate-automerge",
+  "title_prefix": "GitHub Action: ",
+  "pretty": true,
+  "show_logo": "true"
+}

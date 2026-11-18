@@ -1,0 +1,251 @@
+name: Renovate triage
+description: Score the vulnerabilities fixed by a Renovate PR (CVSS) and route it (hotfix, automerge or review), with a Notion ticket for security fixes
+inputs:
+  github_token:
+    description: Token reading the GitHub Advisory Database and editing the PR (pull-requests and issues write)
+    required: false
+    default: ${{ github.token }}
+  pr_number:
+    description: Renovate PR to triage
+    required: false
+    default: ${{ github.event.pull_request.number }}
+  base_sha:
+    description: Base commit of the PR. Check it out (fetch-depth 0) before calling the action
+    required: false
+    default: ${{ github.event.pull_request.base.sha }}
+  head_sha:
+    description: Head commit of the PR, only read as git objects
+    required: false
+    default: ${{ github.event.pull_request.head.sha }}
+  security_label:
+    description: Whether Renovate labelled the PR `security` (a vulnerability fix without a known score is still reviewed as such)
+    required: false
+    default: ${{ contains(github.event.pull_request.labels.*.name, 'security') }}
+  cvss_hotfix_threshold:
+    description: CVSS from which a fix is shipped as a hotfix from the production commit. Above 10, no score reaches it and the hotfix flow is off
+    required: false
+    default: "9.0"
+  cvss_automerge_threshold:
+    description: CVSS from which a fix is merged automatically when it only bumps patch versions
+    required: false
+    default: "4.0"
+  hotfix_enabled:
+    description: Set to false to ship critical fixes through main (automerge tier, critical label, Notion P1) instead of a hotfix
+    required: false
+    default: "true"
+  ecosystems:
+    description: auto, or a comma-separated list of uv, poetry, npm, pnpm, docker, upstream
+    required: false
+    default: auto
+  lockfile_dir:
+    description: Only read dependency files under this directory (monorepos)
+    required: false
+    default: ""
+  upstream_cpes:
+    description: Multi-line `depName=vendor:product` NVD products for the `# renovate:` pins of Dockerfiles (e.g. `openssl/openssl=openssl:openssl`)
+    required: false
+    default: ""
+  nvd_api_key:
+    description: NVD API key, raises the NVD rate limit (upstream ecosystem)
+    required: false
+    default: ""
+  notion_token:
+    description: Notion integration token. Empty to skip the ticket
+    required: false
+    default: ""
+  notion_data_source_id:
+    description: Notion data source of the tickets
+    required: false
+    default: 01cee5a0-2b64-49a0-b9de-82198932bfb6
+  notion_project:
+    description: Prefix of the ticket Project option
+    required: false
+    default: Technique
+  notion_sub_tech_team:
+    description: Prefix of the ticket Sub-Tech-Team option, empty to leave it unset
+    required: false
+    default: ""
+outputs:
+  tier:
+    description: hotfix, automerge, manual or none
+    value: ${{ steps.triage.outputs.tier }}
+  max_cvss:
+    description: Highest CVSS of the fixed advisories, empty when unknown
+    value: ${{ steps.triage.outputs.max_cvss }}
+  critical:
+    description: true when the max CVSS is 9.0 or more
+    value: ${{ steps.triage.outputs.critical }}
+  hotfix_pins:
+    description: Space-separated `ecosystem:name==version` pins replaying the smallest fix (empty if it cannot be replayed)
+    value: ${{ steps.triage.outputs.hotfix_pins }}
+  pr_pins:
+    description: Space-separated pins of the versions the PR locks
+    value: ${{ steps.triage.outputs.pr_pins }}
+  update_level:
+    description: none, digest, patch, minor or major
+    value: ${{ steps.triage.outputs.update_level }}
+  ticket_id:
+    description: Notion ticket id (ALG-NNNN), kept from the previous triage comment when Notion can't be reached
+    value: ${{ steps.comment.outputs.ticket_id || steps.notion.outputs.ticket_id }}
+
+runs:
+  using: composite
+  steps:
+    - name: Prepare
+      id: prepare
+      shell: bash
+      env:
+        HEAD_SHA: ${{ inputs.head_sha }}
+        BASE_SHA: ${{ inputs.base_sha }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        FETCH_TOKEN: ${{ inputs.github_token }}
+        GIT_FETCH: ${{ github.action_path }}/../renovate-security/scripts/git_fetch.sh
+      run: |
+        python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' \
+          || { echo "::error::renovate-triage needs Python 3.11 or later"; exit 1; }
+        if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+          echo "::error::pr_number must be a number"; exit 1
+        fi
+        "$GIT_FETCH" "$HEAD_SHA"
+        merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+        if git diff --name-only "$merge_base" "$HEAD_SHA" | grep -qiE '(^|/)([^/]*\.)?dockerfile(\.[^/]*)?$'; then
+          echo "docker=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Install Trivy
+      if: steps.prepare.outputs.docker == 'true'
+      uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+      with:
+        # A fixed release, never `latest`: these jobs hold tokens, and Trivy releases were
+        # compromised in March 2026 (GHSA-69fq-xp46-6x23). Also lets the binary be cached.
+        version: v0.76.2
+        cache: true
+
+    - name: Score fixed vulnerabilities
+      id: triage
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}/../renovate-security
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        NVD_API_KEY: ${{ inputs.nvd_api_key }}
+        UPSTREAM_CPES: ${{ inputs.upstream_cpes }}
+        BASE_SHA: ${{ inputs.base_sha }}
+        HEAD_SHA: ${{ inputs.head_sha }}
+        SECURITY_LABEL: ${{ inputs.security_label }}
+        HOTFIX_THRESHOLD: ${{ inputs.cvss_hotfix_threshold }}
+        AUTOMERGE_THRESHOLD: ${{ inputs.cvss_automerge_threshold }}
+        HOTFIX_ENABLED: ${{ inputs.hotfix_enabled }}
+        ECOSYSTEMS: ${{ inputs.ecosystems }}
+        LOCKFILE_DIR: ${{ inputs.lockfile_dir }}
+      run: |
+        args=(triage --base "$BASE_SHA" --head "$HEAD_SHA"
+          --hotfix-threshold "$HOTFIX_THRESHOLD" --automerge-threshold "$AUTOMERGE_THRESHOLD"
+          --hotfix-enabled "$HOTFIX_ENABLED" --ecosystems "$ECOSYSTEMS" --lockfile-dir "$LOCKFILE_DIR"
+          --out "$RUNNER_TEMP/triage.json" --markdown "$RUNNER_TEMP/triage.md")
+        [[ "$SECURITY_LABEL" == "true" ]] && args+=(--security-label)
+        python3 -m renovate_security "${args[@]}"
+
+    # A Notion outage must not block labelling and routing.
+    - name: Create or update the Notion ticket
+      id: notion
+      if: steps.triage.outputs.tier != 'none'
+      continue-on-error: true
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}/../renovate-security
+        NOTION_TOKEN: ${{ inputs.notion_token }}
+        PR_URL: ${{ github.server_url }}/${{ github.repository }}/pull/${{ inputs.pr_number }}
+        DATA_SOURCE_ID: ${{ inputs.notion_data_source_id }}
+        PROJECT: ${{ inputs.notion_project }}
+        SUB_TECH_TEAM: ${{ inputs.notion_sub_tech_team }}
+      run: |
+        if [[ -z "$NOTION_TOKEN" ]]; then
+          echo "::warning title=Notion ticket skipped::notion_token is not set"
+          exit 0
+        fi
+        python3 -m renovate_security.notion_ticket upsert --pr-url "$PR_URL" --triage "$RUNNER_TEMP/triage.json" \
+          --data-source-id "$DATA_SOURCE_ID" --project "$PROJECT" --sub-tech-team "$SUB_TECH_TEAM"
+
+    # The PR title stays Renovate's: Renovate rewrites it on every pass (which used to retrigger
+    # this triage), and recognises a PR closed on purpose by its exact title. The Notion ticket is
+    # in the triage comment instead.
+    - name: Update PR labels
+      shell: bash
+      env:
+        GH_REPO: ${{ github.repository }}
+        GH_TOKEN: ${{ inputs.github_token }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        TIER: ${{ steps.triage.outputs.tier }}
+        CRITICAL: ${{ steps.triage.outputs.critical }}
+      run: |
+        routing=(hotfix automerge needs-review critical)
+        if [[ "$TIER" == "none" ]]; then
+          stale=$(gh pr view "$PR_NUMBER" --json labels \
+            --jq '[.labels[].name | select(IN("hotfix", "automerge", "needs-review", "critical"))] | join(",")')
+          [[ -z "$stale" ]] || gh pr edit "$PR_NUMBER" --remove-label "$stale"
+          exit 0
+        fi
+        gh label create security --color B60205 --description "Fixes a known vulnerability" --force
+        gh label create hotfix --color D93F0B --description "CVSS above the hotfix threshold: promoted to prod on merge" --force
+        gh label create automerge --color 0E8A16 --description "Merged automatically once CI is green" --force
+        gh label create needs-review --color FBCA04 --description "Security fix below the automerge threshold" --force
+        gh label create critical --color 5C0011 --description "Fixes a vulnerability with a CVSS of 9.0 or more" --force
+
+        declare -A tier_label=([hotfix]=hotfix [automerge]=automerge [manual]=needs-review)
+        add=("security" "${tier_label[$TIER]}")
+        [[ "$CRITICAL" == "true" ]] && add+=(critical)
+        remove=$(printf '%s\n' "${routing[@]}" | grep -vxF -f <(printf '%s\n' "${add[@]}") | paste -sd, -)
+        gh pr edit "$PR_NUMBER" --add-label "$(IFS=,; echo "${add[*]}")" --remove-label "$remove"
+
+    - name: Post triage comment
+      id: comment
+      if: steps.triage.outputs.tier != 'none'
+      shell: bash
+      env:
+        GH_REPO: ${{ github.repository }}
+        GH_TOKEN: ${{ inputs.github_token }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        TICKET_ID: ${{ steps.notion.outputs.ticket_id }}
+        TICKET_URL: ${{ steps.notion.outputs.ticket_url }}
+      run: |
+        marker="<!-- renovate-triage -->"
+        comment_id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate \
+          --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n1)
+        # Keep the ticket of the previous triage when Notion could not be reached.
+        ticket=""
+        if [[ -n "$TICKET_ID" ]]; then
+          ticket="**Notion ticket:** [$TICKET_ID]($TICKET_URL)"
+        elif [[ -n "$comment_id" ]]; then
+          ticket=$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" --jq .body \
+            | grep -m1 -E '^\*\*Notion ticket:\*\* \[ALG-[0-9]+\]\(https://[^ )]+\)$' || true)
+        fi
+        {
+          echo "$marker"
+          echo "### 🔐 Renovate security triage"
+          echo
+          [[ -n "$ticket" ]] && echo "$ticket" && echo
+          cat "$RUNNER_TEMP/triage.md"
+        } > "$RUNNER_TEMP/comment.md"
+        echo "ticket_id=$(grep -oE 'ALG-[0-9]+' <<<"$ticket" | head -n1 || true)" >> "$GITHUB_OUTPUT"
+        if [[ -n "$comment_id" ]]; then
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" -F body=@"$RUNNER_TEMP/comment.md" > /dev/null
+        else
+          gh pr comment "$PR_NUMBER" --body-file "$RUNNER_TEMP/comment.md"
+        fi
+
+    - name: Summary
+      shell: bash
+      env:
+        TIER: ${{ steps.triage.outputs.tier }}
+        CRITICAL: ${{ steps.triage.outputs.critical }}
+      run: |
+        {
+          echo "### Renovate triage: \`$TIER\`"
+          echo
+          cat "$RUNNER_TEMP/triage.md"
+        } >> "$GITHUB_STEP_SUMMARY"
+        if [[ "$TIER" == "hotfix" ]]; then
+          echo "::warning title=Hotfix::Critical vulnerability fix: a hotfix PR from the production commit is expected, review and merge it ASAP"
+        elif [[ "$CRITICAL" == "true" ]]; then
+          echo "::warning title=Critical fix::Critical vulnerability fixed on main (hotfix flow disabled): merge it and promote it to production ASAP"
+        fi

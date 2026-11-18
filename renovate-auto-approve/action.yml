@@ -1,0 +1,60 @@
+name: Renovate auto-approve
+description: Approve the commit Renovate pushed, so that a Renovate PR needs a single human review
+inputs:
+  github_token:
+    description: Token approving the PR (pull-requests write; enable "Allow GitHub Actions to create and approve pull requests")
+    required: false
+    default: ${{ github.token }}
+  renovate_app_slug:
+    description: Slug of the GitHub App Renovate runs as (`renovate` for the Mend app, your own app when Renovate is self-hosted)
+    required: false
+    default: renovate
+outputs:
+  approved:
+    description: true when the head commit was approved
+    value: ${{ steps.approve.outputs.approved }}
+
+runs:
+  using: composite
+  steps:
+    # Only approve pushes made by Renovate itself, so a commit added by someone else is not approved.
+    # Only `opened` and `synchronize` carry a push: on another activity (e.g. `reopened`), the actor
+    # says nothing about who pushed the head. Reruns keep the original actor while the head may have
+    # moved: never approve from a rerun.
+    - name: Approve the pushed commit
+      id: approve
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        ACTOR: ${{ github.actor }}
+        ACTION: ${{ github.event.action }}
+        RUN_ATTEMPT: ${{ github.run_attempt }}
+        AUTHOR: ${{ github.event.pull_request.user.login }}
+        RENOVATE_APP_SLUG: ${{ inputs.renovate_app_slug }}
+        DRAFT: ${{ github.event.pull_request.draft }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        echo "approved=false" >> "$GITHUB_OUTPUT"
+        if [[ ! "$RENOVATE_APP_SLUG" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+          echo "::error::renovate_app_slug must be a GitHub App slug"; exit 1
+        fi
+        renovate_bot="${RENOVATE_APP_SLUG}[bot]"
+        if [[ "$GITHUB_EVENT_NAME" != pull_request* || "$ACTOR" != "$renovate_bot" || "$AUTHOR" != "$renovate_bot" ]]; then
+          echo "Not a push from Renovate on its own PR, not approving"; exit 0
+        fi
+        if [[ "$ACTION" != "opened" && "$ACTION" != "synchronize" ]]; then
+          echo "'$ACTION' is not a push, not approving"; exit 0
+        fi
+        if [[ "$RUN_ATTEMPT" != "1" || "$DRAFT" == "true" ]]; then
+          echo "Rerun or draft PR, not approving"; exit 0
+        fi
+        # The review is pinned to the commit Renovate pushed, and skipped if the head already moved.
+        current=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)
+        if [[ "$current" != "$HEAD_SHA" ]]; then
+          echo "Head moved to $current since $HEAD_SHA was pushed, not approving"; exit 0
+        fi
+        gh api -X POST "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" \
+          -f event=APPROVE -f commit_id="$HEAD_SHA" > /dev/null
+        echo "approved=true" >> "$GITHUB_OUTPUT"
+        echo "Approved $HEAD_SHA"

@@ -21,7 +21,7 @@ jobs:
       # Same Python as ubuntu-latest runners, where the actions run with the system python3.
       - uses: actions/setup-python@v7
         with:
-          python-version: '3.12'
+          python-version: '3.15'
 
       - name: Install test dependencies
         run: pip install pytest pyyaml
